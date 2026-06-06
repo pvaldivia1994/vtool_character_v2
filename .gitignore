@@ -14,3 +14,6 @@ env/
 *.sqlite3
 .DS_Store
 Thumbs.db
+
+# Generated character data (runtime)
+src/vtool_character_v2/characters/
