@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vtool_character_v2"
+version = "0.1.0"
+description = "Character System para vtool_llama — DNA, Soul, Psychology, Compiler"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["llama", "gguf", "llm", "ai", "character", "roleplay", "windows"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "chromadb>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/pvaldivia1994/vtool_llama"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vtool_character_v2", "vtool_character_v2.*"]
+
+[tool.setuptools.package-data]
+vtool_character_v2 = ["config/prompts/*.md"]

@@ -1,0 +1,4 @@
+[WORLD]
+#HAS_SCENARIO
+Current scenario: #SCENARIO_TEXT
+/HAS_SCENARIO

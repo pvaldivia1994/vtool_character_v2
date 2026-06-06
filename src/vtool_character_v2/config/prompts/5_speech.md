@@ -1,0 +1,7 @@
+[SPEECH STYLE]
+Style: #STYLE
+Tone: #TONE
+Verbosity: #VERBOSITY
+#HAS_EMOTIONS
+Base emotions: #EMOTIONS_TEXT
+/HAS_EMOTIONS

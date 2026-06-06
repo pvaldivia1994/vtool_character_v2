@@ -1,0 +1,4 @@
+[HARD RULES — Character Restrictions]
+#HAS_NEVER_DO
+#NEVER_DO_ITEMS
+/HAS_NEVER_DO
