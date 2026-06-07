@@ -67,6 +67,19 @@ class MemoryEntry:
 
 
 @dataclass
+class ContextSummary:
+    session_id: str = ""
+    summary: str = ""
+    summarized_message_count: int = 0
+    summary_version: int = 1
+    character_name: str = ""
+    title: str = ""
+    model_name: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
 class EpisodeSnapshot:
     episode_id: int | str = 0
     timestamp: str = ""

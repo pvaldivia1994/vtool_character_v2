@@ -35,16 +35,37 @@ CharacterManager._load_dna = _load_dna
 def _load_memory(self: CharacterManager) -> None:
     if not self._char_dir:
         return
-    mem_file = self._char_dir / "_memory" / "long_term.json"
-    data = self._read_json_dict(mem_file)
+    from ..db.character_memory import CharacterMemoryStore
 
-    self._needs_rebuild = data.get("rebuild", True)
+    db_path = self.get_chat_db_path()
+    store = CharacterMemoryStore(db_path)
+    store.initialize()
 
-    raw_mems = data.get("memories", [])
-    self.memories = [
-        MemoryEntry(**{k: v for k, v in m.items() if k in MemoryEntry.__dataclass_fields__})
-        for m in raw_mems
-    ]
+    legacy_file = self._char_dir / "_memory" / "long_term.json"
+    legacy_data = self._read_json_dict(legacy_file)
+
+    db_memories = store.load_all()
+    legacy_db_path = self._char_dir / "_memory" / "character_memories.db"
+    if not db_memories and legacy_db_path.exists():
+        legacy_store = CharacterMemoryStore(legacy_db_path)
+        legacy_store.initialize()
+        legacy_memories = legacy_store.load_all()
+        if legacy_memories:
+            store.replace_all(legacy_memories)
+            db_memories = legacy_memories
+
+    if db_memories:
+        self.memories = db_memories
+    else:
+        raw_mems = legacy_data.get("memories", [])
+        self.memories = [
+            MemoryEntry(**{k: v for k, v in m.items() if k in MemoryEntry.__dataclass_fields__})
+            for m in raw_mems
+        ]
+        if self.memories:
+            store.replace_all(self.memories)
+
+    self._needs_rebuild = legacy_data.get("rebuild", True)
 
 CharacterManager._load_memory = _load_memory
 
@@ -88,6 +109,12 @@ def save_state(self: CharacterManager) -> None:
     if not self._char_dir:
         return
     with self._lock:
+        from ..db.character_memory import CharacterMemoryStore
+
+        memory_store = CharacterMemoryStore(self.get_chat_db_path())
+        memory_store.initialize()
+        memory_store.replace_all(self.memories)
+
         mem_data = {
             "rebuild": self._needs_rebuild,
             "memories": [asdict(m) for m in self.memories],
@@ -131,7 +158,7 @@ def add_memory(
         self._needs_rebuild = True
         self._prompt_dirty = True
         self.save_state()
-        self._log("CHAR", f"Memoria añadida: '{content[:50]}...'")
+        self._log("CHAR", f"Memoria añadida en SQLite: '{content[:50]}...'")
         return entry
 
 CharacterManager.add_memory = add_memory

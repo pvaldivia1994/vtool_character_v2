@@ -1,0 +1,59 @@
+# openspec/config.yaml
+schema: spec-driven
+
+context: |
+  Tech stack: Python 3.11+, setuptools, src layout
+  Package: vtool_character_v2 — Character System for vtool_llama
+  Architecture: DNA (Identity, Personality, Speech, Rules),
+    Soul System (simulated life events, episodic memory),
+    Psychology Engine (runtime state, beliefs, emotions, drift),
+    Compiler (system prompt assembly, multi-layer YAML DNA)
+  Key dependencies: chromadb>=0.4.0, optional vtool_llama_v2 (LLMClient protocol)
+  Testing: pytest 9.0.3, ruff 0.15.14 (linter)
+  Repo: github.com/pvaldivia1994/vtool_character_v2 (MIT)
+
+strict_tdd: true
+
+testing:
+  runner: pytest
+  runner_command: python -m pytest
+  layers:
+    unit: false
+    integration: true
+    e2e: false
+  coverage: false
+  quality:
+    linter: ruff
+    type_checker: false
+    formatter: false
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Define scope boundaries (what's in/out)
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Cover integration paths with ChromaDB and SQLite
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+    - Note LLM dependency boundaries (optional vtool_llama_v2)
+  tasks:
+    - Group by module, use hierarchical numbering
+    - Keep tasks completable in one session
+    - Reference test class names from test_integration.py
+  apply:
+    - Follow existing code patterns
+    tdd: true
+    test_command: python -m pytest
+  verify:
+    test_command: python -m pytest
+    build_command: python -m build
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
+
+chaining:
+  review_budget: 400
+  chain_strategy: unset

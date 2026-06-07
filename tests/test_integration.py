@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from vtool_character_v2.types import CharacterLoadResult
+from vtool_character_v2.types import CharacterLoadResult, MemoryEntry
 
 
 class TestCharacterLoading:
@@ -43,6 +44,31 @@ class TestCharacterLoading:
     def test_dna_is_loaded(self, loaded_cm):
         assert loaded_cm.identity.name == "test_personaje"
         assert "curioso" in loaded_cm.personality_dna.traits
+
+    def test_load_character_autoloads_latest_sqlite_episode(self, cm, create_test_character):
+        from vtool_llama_v2.chat_store import SQLiteChatStore
+
+        store = SQLiteChatStore(str(cm._base_dir / create_test_character / "_memory" / "chat_history.db"))
+        try:
+            store.initialize()
+            store.upsert_session("chat_001", character_name=create_test_character, title="Historial", summary="Resumen")
+            store.replace_session_messages(
+                "chat_001",
+                [
+                    {"role": "system", "content": "prompt"},
+                    {"role": "user", "content": "Hola"},
+                    {"role": "assistant", "content": "Hola, ¿en qué te ayudo?"},
+                ],
+            )
+        finally:
+            store.close()
+
+        cm.load_character(create_test_character)
+
+        assert cm.current_episode is not None
+        assert cm.current_episode.source == "sqlite"
+        assert cm.current_episode.episode_id == "chat_001"
+        assert len(cm.current_episode.messages) == 3
 
 
 class TestChromaClose:
@@ -264,6 +290,50 @@ class TestManagerBuildPrompt:
         prompt = loaded_cm.build_compact_system_prompt("Eres un asistente.")
         assert isinstance(prompt, str)
 
+    def test_build_full_system_prompt_includes_chat_memory_when_query_is_provided(self, loaded_cm, monkeypatch):
+        monkeypatch.setattr(
+            loaded_cm,
+            "get_chat_memories_block",
+            lambda query, top_k=5: f"[CHAT MEMORIES]\n- {query}",
+        )
+        prompt = loaded_cm.build_full_system_prompt(
+            "Eres un asistente.",
+            chat_query="prefiere respuestas cortas",
+        )
+        assert "[CHAT MEMORIES]" in prompt
+        assert "prefiere respuestas cortas" in prompt
+
+    def test_build_full_system_prompt_skips_empty_optional_blocks(self, loaded_cm, monkeypatch):
+        monkeypatch.setattr(loaded_cm._compiler, "_resolve_few_shot_examples", lambda: "")
+        monkeypatch.setattr(loaded_cm._compiler, "_resolve_orquestador_context", lambda: "")
+        monkeypatch.setattr(loaded_cm, "get_chat_memories_block", lambda query, top_k=5: "")
+
+        prompt = loaded_cm.build_full_system_prompt("Eres un asistente.")
+
+        assert "[FEW SHOT EXAMPLES]" not in prompt
+        assert "[CONTEXT]" not in prompt
+
+    def test_build_chat_messages_keeps_fixed_prefix_and_recent_history(self, loaded_cm, monkeypatch):
+        monkeypatch.setattr(
+            loaded_cm,
+            "get_chat_memories_block",
+            lambda query, top_k=5: f"[CHAT MEMORIES]\n- {query}",
+        )
+        history = [{"role": "user", "content": f"user{i}"} for i in range(1, 7)]
+        messages = loaded_cm.build_chat_messages(
+            base_system_prompt="Eres un asistente.",
+            user_message="hola",
+            session_id="s1",
+            history_limit=3,
+            chat_query="hola",
+            source_messages=history,
+        )
+        assert messages[0]["role"] == "system"
+        assert "[CHAT MEMORIES]" in messages[0]["content"]
+        assert [m["content"] for m in messages[1:-1]] == ["user4", "user5", "user6"]
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"] == "hola"
+
 
 class TestPromptCacheInvalidation:
     """Hallazgo 1: build_system_prompt() no debe cachear con base distinta."""
@@ -300,7 +370,7 @@ class TestSnapshotRestore:
             "identity", "personality_dna", "speech", "rules", "memories",
             "runtime_state", "personality_state", "relationship_state", "active_mods",
             "_cached_prompt_hash", "_needs_rebuild", "_soul_accessor",
-            "_psychology_manager", "_genome", "_core_identity", "current_episode",
+            "_psychology_manager", "_genome", "_core_identity", "current_episode", "_chat_memory",
         }
         assert expected_keys.issubset(snap.keys()), f"Faltan keys en snapshot: {expected_keys - snap.keys()}"
 
@@ -455,6 +525,342 @@ class TestChatDbPaths:
         cm.load_character(create_test_character)
         expected = cm._char_dir / "_memory" / "chat_history.db"
         assert cm.get_chat_db_path() == expected
+
+    def test_get_memory_db_path_returns_correct_path(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        expected = cm._char_dir / "_memory" / "chat_history.db"
+        assert cm.get_memory_db_path() == expected
+
+    def test_context_summary_roundtrip(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.add_memory("El usuario prefiere respuestas directas y técnicas.", priority=0.9, always_include=True)
+        cm.append_chat_session_messages(
+            "chat_001",
+            [
+                {"role": "user", "content": "Hola"},
+                {"role": "assistant", "content": "Hola, gusto en ayudarte."},
+                {"role": "user", "content": "Recuerda que me gusta Python."},
+            ],
+            character_name=cm.character_name,
+        )
+        cm.save_context_summary(
+            session_id="chat_001",
+            summary="El usuario prefiere Python y una conversacion directa.",
+            summarized_message_count=3,
+            title="Test",
+            model_name="model-x",
+        )
+
+        summary = cm.get_context_summary("chat_001")
+        assert summary is not None
+        assert summary.summary.startswith("El usuario prefiere Python")
+        assert summary.summarized_message_count == 3
+
+        messages = cm.build_chat_messages_from_summary(
+            base_system_prompt="Eres un asistente.",
+            user_message="¿Qué recuerdas?",
+            session_id="chat_001",
+            history_limit=40,
+            chat_query="¿Qué recuerdas?",
+        )
+        assert "Eres un asistente." in messages[0]["content"]
+        assert any("MEMORIA RELEVANTE" in m["content"] for m in messages)
+        assert any("[CONTEXT SUMMARY]" in m["content"] for m in messages)
+
+    def test_build_context_summary_messages_uses_expert_system_and_structured_user_payload(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.append_chat_session_messages(
+            "chat_002",
+            [
+                {"role": "user", "content": "Me llamo Pedro."},
+                {"role": "assistant", "content": "Mucho gusto, Pedro."},
+                {"role": "user", "content": "A ti te gusta el terror."},
+                {"role": "assistant", "content": "Si, me gusta mucho el terror."},
+            ],
+            character_name=cm.character_name,
+        )
+        cm.save_context_summary(
+            session_id="chat_002",
+            summary="Resumen previo corto.",
+            summarized_message_count=0,
+            title="Test",
+            model_name="model-x",
+        )
+
+        messages = cm.build_context_summary_messages(
+            session_id="chat_002",
+            summary_system_prompt="Eres un experto en resumir conversaciones.",
+            history_limit=10,
+        )
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert "experto en resumir conversaciones" in messages[0]["content"]
+        assert messages[1]["role"] == "user"
+        assert "Resumen anterior:" in messages[1]["content"]
+        assert "Bloque de conversacion a resumir:" in messages[1]["content"]
+        assert "Usuario dijo: Me llamo Pedro." in messages[1]["content"]
+        assert f"{cm.identity.name} dijo: Mucho gusto, Pedro." in messages[1]["content"]
+
+    def test_store_extracted_memories_from_json(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        created = cm.store_extracted_memories_from_json(
+            """
+            [
+              {"content": "El usuario prefiere respuestas cortas.", "priority": 0.9, "always_include": true, "tags": ["preferencias"]},
+              {"content": "Al usuario le gusta Python.", "priority": 0.8, "always_include": false, "tags": ["tecnologia"]}
+            ]
+            """
+        )
+        assert len(created) == 2
+        assert any("Python" in m.content for m in cm.get_relevant_memories())
+
+    def test_build_long_term_memory_extraction_messages_includes_existing_memories_and_new_chat_block(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.add_memory("El usuario se llama Pedro.", priority=0.9, always_include=True)
+        messages = cm.build_long_term_memory_extraction_messages(
+            [
+                {"role": "user", "content": "Me llamo Pedro."},
+                {"role": "assistant", "content": "A mi me gusta el terror."},
+            ],
+            cm.build_default_memory_extraction_prompt(),
+        )
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert "No repitas recuerdos ya guardados" in messages[0]["content"]
+        assert messages[1]["role"] == "user"
+        assert "Recuerdos anteriores que NO debes repetir:" in messages[1]["content"]
+        assert "El usuario se llama Pedro." in messages[1]["content"]
+        assert "Nuevos chats:" in messages[1]["content"]
+        assert "Usuario dijo: Me llamo Pedro." in messages[1]["content"]
+        assert f"{cm.identity.name} dijo: A mi me gusta el terror." in messages[1]["content"]
+
+    def test_store_extracted_memories_from_json_skips_questions_and_duplicates(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.add_memory("El usuario se llama Pedro.", priority=0.9, always_include=True)
+        created = cm.store_extracted_memories_from_json(
+            """
+            [
+              {"content": "¿Cómo se llama?", "priority": 0.3, "always_include": false, "tags": []},
+              {"content": "El usuario se llama Pedro.", "priority": 0.9, "always_include": true, "tags": ["identidad"]},
+              {"content": "A Luna le gusta el terror.", "priority": 0.8, "always_include": false, "tags": ["gustos"]},
+              {"content": "Su nombre?", "priority": 0.2, "always_include": false, "tags": []}
+            ]
+            """
+        )
+
+        assert len(created) == 1
+        assert created[0].content == "A Luna le gusta el terror."
+
+    def test_store_extracted_memories_from_summary_fallback_is_disabled(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        created = cm.store_extracted_memories_from_summary("Cualquier summary.", max_items=5)
+        assert created == []
+
+    def test_store_extracted_memories_from_summary_fallback(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        created = cm.store_extracted_memories_from_summary(
+            "El usuario trabaja en recursos humanos y le gusta Python. También valora respuestas directas y cortas."
+        )
+        assert created == []
+
+    def test_cleanup_character_memories_removes_noise_and_keeps_valid_memories(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.memories = [
+            MemoryEntry(content="¿Como se llama?", priority=3.0, always_include=False, tags=[]),
+            MemoryEntry(content="los libros de misterio", priority=5.0, always_include=True, tags=["libros"]),
+            MemoryEntry(content="El User se llama Pedro.", priority=0.9, always_include=True, tags=["identidad"]),
+            MemoryEntry(content="El User se llama Pedro.", priority=0.8, always_include=False, tags=["duplicado"]),
+            MemoryEntry(content="A Luna le gustan los libros de terror.", priority=0.8, always_include=False, tags=["gustos"]),
+            MemoryEntry(content="Ultimo dialogo relevante: Pedro preguntó algo.", priority=0.7, always_include=False, tags=["summary_fallback"]),
+        ]
+
+        result = cm.cleanup_character_memories()
+
+        assert result["removed"] == 4
+        contents = [m.content for m in cm.memories]
+        assert contents == [
+            "El User se llama Pedro.",
+            "A Luna le gustan los libros de terror.",
+        ]
+
+    def test_backfill_context_summary_summarizes_only_full_windows(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.append_chat_session_messages(
+            "chat_001",
+            [
+                {"role": "user", "content": "M1"},
+                {"role": "assistant", "content": "A1"},
+                {"role": "user", "content": "M2"},
+                {"role": "assistant", "content": "A2"},
+                {"role": "user", "content": "M3"},
+                {"role": "assistant", "content": "A3"},
+                {"role": "user", "content": "M4"},
+                {"role": "assistant", "content": "A4"},
+                {"role": "user", "content": "M5"},
+                {"role": "assistant", "content": "A5"},
+            ],
+            character_name=cm.character_name,
+        )
+
+        class _Resp:
+            def __init__(self, content: str, success: bool = True):
+                self.content = content
+                self.success = success
+                self.error = ""
+
+        class _ChatStub:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, messages: list[dict]):
+                self.calls += 1
+                if self.calls % 2 == 1:
+                    return _Resp(f"summary_{self.calls}")
+                return _Resp(
+                    """
+                    [
+                      {"content": "El User se llama Pedro.", "priority": 0.8, "always_include": true, "tags": ["test"]}
+                    ]
+                    """
+                )
+
+        stub = _ChatStub()
+        saved = cm.backfill_context_summary(
+            session_id="chat_001",
+            chat_callable=stub,
+            summary_system_prompt="resumir",
+            extraction_system_prompt="extraer",
+            every_n_messages=4,
+            title="Test",
+            model_name="stub-model",
+            character_name=cm.character_name,
+        )
+
+        assert saved
+        assert len(saved) == 2
+
+        all_summaries = cm.list_context_summaries()
+        assert len([s for s in all_summaries if s.session_id == "chat_001"]) == 2
+
+        summary = cm.get_context_summary("chat_001")
+        assert summary is not None
+        assert summary.summarized_message_count == 8
+        assert summary.summary == "summary_3"
+        assert any(m.content == "El User se llama Pedro." for m in cm.get_relevant_memories())
+
+    def test_build_chat_messages_from_summary_resets_active_window_after_exact_limit(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.append_chat_session_messages(
+            "chat_010",
+            [
+                {"role": "user", "content": "M1"},
+                {"role": "assistant", "content": "A1"},
+                {"role": "user", "content": "M2"},
+                {"role": "assistant", "content": "A2"},
+                {"role": "user", "content": "M3"},
+                {"role": "assistant", "content": "A3"},
+                {"role": "user", "content": "M4"},
+                {"role": "assistant", "content": "A4"},
+                {"role": "user", "content": "M5"},
+                {"role": "assistant", "content": "A5"},
+            ],
+            character_name=cm.character_name,
+        )
+
+        class _Resp:
+            def __init__(self, content: str, success: bool = True):
+                self.content = content
+                self.success = success
+                self.error = ""
+
+        class _ChatStub:
+            def __call__(self, messages: list[dict]):
+                if messages and messages[-1]["role"] == "user":
+                    return _Resp("Resumen del bloque 1 al 10.")
+                return _Resp(
+                    """
+                    [
+                      {"content": "El usuario viene de una conversacion previa.", "priority": 0.8, "always_include": true, "tags": ["test"]}
+                    ]
+                    """
+                )
+
+        cm.backfill_context_summary(
+            session_id="chat_010",
+            chat_callable=_ChatStub(),
+            summary_system_prompt="resumir",
+            extraction_system_prompt="extraer",
+            every_n_messages=10,
+            title="Test",
+            model_name="stub-model",
+            character_name=cm.character_name,
+        )
+
+        messages = cm.build_chat_messages_from_summary(
+            base_system_prompt="Eres Luna.",
+            user_message="M11",
+            session_id="chat_010",
+            history_limit=10,
+            chat_query="M11",
+        )
+
+        non_system = [m for m in messages if m["role"] != "system"]
+        assert len(non_system) == 1
+        assert non_system[0]["role"] == "user"
+        assert non_system[0]["content"] == "M11"
+        assert any("[CONTEXT SUMMARY]" in m["content"] for m in messages if m["role"] == "system")
+
+    def test_character_memories_load_from_sqlite_after_json_is_removed(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        cm.add_memory("Este recuerdo debe vivir en SQLite.", priority=0.9, always_include=True)
+
+        db_path = cm.get_memory_db_path()
+        assert db_path.exists()
+
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM character_memories").fetchone()
+            assert row is not None
+            assert row[0] >= 1
+
+        legacy_file = cm._char_dir / "_memory" / "long_term.json"
+        if legacy_file.exists():
+            legacy_file.unlink()
+
+        cm2 = type(cm)(base_dir=str(cm._base_dir))
+        cm2.load_character(create_test_character)
+        memories = [m.content for m in cm2.get_relevant_memories()]
+        assert "Este recuerdo debe vivir en SQLite." in memories
+
+    def test_write_chat_turn_log_creates_markdown_file(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        log_path = cm.write_chat_turn_log(
+            session_id="chat_001",
+            turn_index=1,
+            user_message="hola",
+            response_message="buenas",
+            messages_sent=[
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "hola"},
+            ],
+            flow_steps=[
+                "1. Se construyó el contexto.",
+                "2. Se envió al modelo.",
+                "3. Se registró el turno.",
+            ],
+        )
+
+        assert log_path.exists()
+        assert log_path.parent == cm.get_chat_log_dir()
+        assert log_path.suffix == ".md"
+        content = log_path.read_text(encoding="utf-8")
+        assert "# Chat Turn 1" in content
+        assert "hola" in content
+        assert "buenas" in content
+        assert "Fecha de ejecucion" in content
+        assert "## Recuerdos relevantes" in content
+        assert "## Memoria semantica" in content
 
 
 class TestChatSessionWrappers:
@@ -699,3 +1105,64 @@ class TestChatIntegrationScope:
         assert session["title"] == "Test"
         assert session["summary"] == "Resumen"
         assert session["character_name"] == cm.character_name
+
+
+class TestChatMemory:
+    """Memoria semántica conversacional con ChromaDB."""
+
+    def test_chat_memory_initialized_after_load(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        assert cm._chat_memory is not None
+
+    def test_add_and_search_memory(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        if not cm._chat_memory.is_available:
+            pytest.skip("ChromaDB no disponible")
+
+        cm._chat_memory.add_memory(
+            "El usuario prefiere respuestas cortas y directas.",
+            session_id="chat_001",
+            importance=0.8,
+            topic="user_preferences",
+        )
+        cm._chat_memory.add_memory(
+            "El usuario trabaja con Python en Windows.",
+            session_id="chat_001",
+            importance=0.6,
+            topic="user_context",
+        )
+
+        results = cm.search_chat_memories("what does the user prefer?", top_k=5)
+        assert len(results) >= 1
+        docs = [r["document"].lower() for r in results]
+        assert any("respuestas cortas" in d for d in docs)
+
+    def test_chat_memories_block_format(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        if not cm._chat_memory.is_available:
+            pytest.skip("ChromaDB no disponible")
+
+        cm._chat_memory.add_memory(
+            "El usuario odia los audios largos.",
+            session_id="chat_001",
+            importance=0.9,
+            topic="user_preferences",
+        )
+
+        block = cm.get_chat_memories_block("user preferences", top_k=5)
+        assert "CHAT MEMORIES" in block
+        assert "odia" in block.lower()
+
+    def test_search_empty_when_no_memories(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        results = cm.search_chat_memories("anything", top_k=5)
+        assert results == []
+
+    def test_memory_count(self, cm, create_test_character):
+        cm.load_character(create_test_character)
+        if not cm._chat_memory.is_available:
+            pytest.skip("ChromaDB no disponible")
+
+        cm.add_chat_memory("Test memory one.", importance=0.5)
+        cm.add_chat_memory("Test memory two.", importance=0.5)
+        assert cm._chat_memory.memory_count >= 2

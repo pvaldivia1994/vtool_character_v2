@@ -7,6 +7,7 @@ from .character import (
     CharacterLoadResult,
     CharacterMod,
     EpisodeSnapshot,
+    ContextSummary,
     IdentityDNA,
     MemoryEntry,
     PersonalityDNA,
@@ -31,7 +32,7 @@ from .psychology import (
 
 __all__ = [
     "ConfigSchema",
-    "CharacterLoadResult", "CharacterMod", "EpisodeSnapshot",
+    "CharacterLoadResult", "CharacterMod", "ContextSummary", "EpisodeSnapshot",
     "IdentityDNA", "MemoryEntry", "PersonalityDNA", "PersonalityState",
     "RelationshipState", "RulesDNA", "RuntimeState", "SpeechDNA",
     "BeliefEntry", "CoreIdentity", "DriftEntry", "EmotionalMemory",

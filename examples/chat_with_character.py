@@ -1,13 +1,13 @@
 """
 Interactive example: create a character and converse with it.
 
-Requires vtool_llama_v2 with a GGUF model loaded for real conversation.
-Without a model, it compiles the system prompt and shows the character structure.
+This version keeps the historical logic inside vtool_character_v2:
+- CharacterManager builds the full message list.
+- vtool_llama_v2 only generates from explicit messages.
+- SQLite persistence is handled by the character project.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from vtool_character_v2 import CharacterManager
 
@@ -91,7 +91,7 @@ def chat_with_llm(cm: CharacterManager, name: str):
         print("  Set VTOOL_LLAMA_MODEL_PATH to a .gguf model path.")
         return False
 
-    # Try to create a session to verify the model is usable
+    # Use a lightweight runtime session only as a model wrapper.
     try:
         adapter = VToolLlamaAdapter(llm)
         soul = SoulGenerator(
@@ -99,21 +99,42 @@ def chat_with_llm(cm: CharacterManager, name: str):
             config=llm.get_config(),
             llm_client=adapter,
         )
+        _ = soul
         session = llm.create_session(
-            session_id=f"chat_{name.lower()}",
+            session_id=f"runtime_{name.lower()}",
             character_name=name,
-            chat_db_path=str(cm.get_chat_db_path()),
-            persistent=True,
+            persistent=False,
         )
-        session.set_system_prompt(
-            cm.build_full_system_prompt(f"You are {name}, a writer and poet.")
-        )
-        session.set_character_name(name)
     except Exception as e:
         print(f"  Could not create chat session: {e}")
         return False
 
     print(f"\n  Chatting with {name}. Type 'quit' to exit.\n")
+
+    history_limit = 10
+    summary_system_prompt = cm.build_default_summary_system_prompt()
+    memory_extraction_prompt = cm.build_default_memory_extraction_prompt()
+
+    session_id = (
+        str(cm.current_episode.episode_id)
+        if cm.current_episode and getattr(cm.current_episode, "source", "") == "sqlite"
+        else f"chat_{name.lower()}"
+    )
+
+    if cm.current_episode and getattr(cm.current_episode, "source", "") == "sqlite":
+        backfilled = cm.backfill_context_summary(
+            session_id=session_id,
+            chat_callable=lambda messages: session.chat(messages=messages),
+            summary_system_prompt=summary_system_prompt,
+            extraction_system_prompt=memory_extraction_prompt,
+            every_n_messages=history_limit,
+            history_limit=80,
+            title=f"Chat with {name}",
+            model_name=llm.get_model_info().get("model_name", ""),
+            character_name=name,
+        )
+        if backfilled:
+            print(f"  Context summary backfilled in {len(backfilled)} step(s).")
 
     while True:
         try:
@@ -125,11 +146,79 @@ def chat_with_llm(cm: CharacterManager, name: str):
         if text.lower() in ("quit", "exit", "salir"):
             break
 
-        response = session.chat(text)
+        if cm.should_summarize_before_next_message(session_id, history_limit=history_limit):
+            refreshed = cm.backfill_context_summary(
+                session_id=session_id,
+                chat_callable=lambda messages: session.chat(messages=messages),
+                summary_system_prompt=summary_system_prompt,
+                extraction_system_prompt=memory_extraction_prompt,
+                every_n_messages=history_limit,
+                history_limit=80,
+                title=f"Chat with {name}",
+                model_name=llm.get_model_info().get("model_name", ""),
+                character_name=name,
+            )
+            if refreshed:
+                print(f"  Context summary refreshed in {len(refreshed)} step(s) before the next message.")
+
+        history = cm.get_chat_history_messages(session_id=session_id, history_limit=history_limit)
+
+        messages = cm.build_chat_messages_from_summary(
+            base_system_prompt=f"You are {name}, a writer and poet.",
+            user_message=text,
+            session_id=session_id,
+            history_limit=history_limit,
+            chat_query=text,
+        )
+        response = session.chat(messages=messages)
         safe_text = response.content.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         print(f"  {name}: {safe_text}")
 
-    session.save_to_store(summary=f"Conversation with {name}")
+        flow_steps = [
+            "1. El character cargó el historial relevante desde SQLite.",
+            "2. El character construyó la lista completa de mensajes.",
+            "3. La lista se envió a session.chat(messages=...).",
+            "4. El modelo generó la respuesta.",
+        ]
+
+        if response.success:
+            assistant_message = {"role": "assistant", "content": response.content}
+            if response.thinking:
+                assistant_message["thinking"] = response.thinking
+            if response.tool_calls:
+                assistant_message["tool_calls"] = response.tool_calls
+
+            cm.append_chat_session_messages(
+                session_id=session_id,
+                messages=[
+                    {"role": "user", "content": text},
+                    assistant_message,
+                ],
+                character_name=name,
+                model_name=llm.get_model_info().get("model_name", ""),
+            )
+            flow_steps.append("5. El turno se guardó en SQLite sin reemplazar el historial.")
+
+            flow_steps.append("6. Si el bloque activo llega al limite, el resumen se recalcula antes del siguiente mensaje.")
+        else:
+            flow_steps.append("5. No se escribió en SQLite porque la generación falló.")
+
+        active_summary = cm.get_context_summary(session_id)
+        cm.write_chat_turn_log(
+            session_id=session_id,
+            turn_index=cm.count_chat_turn_logs() + 1,
+            user_message=text,
+            response_message=response.content,
+            messages_sent=messages,
+            flow_steps=flow_steps,
+            error=None if response.success else response.error,
+            system_prompt=messages[0].get("content", ""),
+            chat_query=text,
+            context_summary=active_summary.summary if active_summary else "",
+            summarized_message_count=active_summary.summarized_message_count if active_summary else 0,
+            source_messages=history,
+        )
+
     print(f"\n  Session saved to: {cm.get_chat_db_path()}")
     return True
 
@@ -146,7 +235,6 @@ def main():
     print("\n=== Character System -- vtool_character_v2 ===\n")
 
     cm = CharacterManager()
-    # Clean up previous run if needed
     name = "Elena"
     char_dir = cm._base_dir / name
     if char_dir.exists():
@@ -178,12 +266,14 @@ def main():
         print(f"  {prompt[:400]}")
         print("\n  For real conversation, install vtool_llama_v2 and load a GGUF model.")
 
-    # Show saved sessions
-    sessions = cm.list_chat_sessions()
-    if sessions:
-        print(f"\n  Saved sessions: {len(sessions)}")
-        for s in sessions:
-            print(f"    * {s['session_id']}: {s.get('title', 'untitled')}")
+    try:
+        sessions = cm.list_chat_sessions()
+        if sessions:
+            print(f"\n  Saved sessions: {len(sessions)}")
+            for s in sessions:
+                print(f"    * {s['session_id']}: {s.get('title', 'untitled')}")
+    except RuntimeError:
+        pass
 
 
 if __name__ == "__main__":

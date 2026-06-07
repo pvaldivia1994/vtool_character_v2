@@ -78,26 +78,37 @@ class CharacterCompiler:
     def __init__(self, manager: CharacterManager):
         self.manager = manager
 
-    def compile_prompt(self, base_system_prompt: str, config: Optional[ConfigSchema] = None) -> str:
-        static = self.compile_static_prompt(base_system_prompt, config)
+    def compile_prompt(
+        self,
+        base_system_prompt: str,
+        config: Optional[ConfigSchema] = None,
+        chat_query: Optional[str] = None,
+    ) -> str:
+        static = self.compile_static_prompt(base_system_prompt, config, chat_query=chat_query)
         dynamic = self.compile_dynamic_prompt()
         if dynamic:
             return f"{static}\n\n{dynamic}"
         return static
 
-    def compile_static_prompt(self, base_system_prompt: str, config: Optional[ConfigSchema] = None) -> str:
+    def compile_static_prompt(
+        self,
+        base_system_prompt: str,
+        config: Optional[ConfigSchema] = None,
+        chat_query: Optional[str] = None,
+    ) -> str:
         if not self.manager.is_loaded:
             return base_system_prompt
 
-        parts = [base_system_prompt]
+        parts = []
+        self._try_add(parts, base_system_prompt)
 
         # 1. [SYSTEM CORE]
-        parts.append(self._resolve_system_core())
+        self._try_add(parts, self._resolve_system_core())
 
         # 2. [SECTION REFERENCE] eliminado — no aporta valor, solo era un índice
 
         # 3–6. Behavioral layers (anti_assistant.yaml)
-        parts.append(self._resolve_anti_assistant())
+        self._try_add(parts, self._resolve_anti_assistant())
 
         # 7. [IDENTITY]
         self._try_add(parts, self._resolve_identity())
@@ -130,8 +141,7 @@ class CharacterCompiler:
 
         # 22. [CONTEXT] — tags dinámicos del orquestador
         ctx = self._resolve_orquestador_context()
-        if ctx:
-            parts.append(ctx)
+        self._try_add(parts, ctx)
 
         # 23. [FEW SHOT EXAMPLES]
         self._try_add(parts, self._resolve_few_shot_examples())
@@ -140,17 +150,35 @@ class CharacterCompiler:
         self._try_add(parts, self._resolve_soul())
         self._try_add(parts, self._resolve_beliefs_contradictions())
 
+        if chat_query:
+            chat_memories = self.manager.get_chat_memories_block(chat_query)
+            self._try_add(parts, chat_memories)
+
         return "\n".join(parts)
 
-    def compile_full_prompt(self, base_system_prompt: str, config: Optional[ConfigSchema] = None) -> str:
-        return self.compile_static_prompt(base_system_prompt, config)
+    def compile_full_prompt(
+        self,
+        base_system_prompt: str,
+        config: Optional[ConfigSchema] = None,
+        chat_query: Optional[str] = None,
+    ) -> str:
+        return self.compile_static_prompt(base_system_prompt, config, chat_query=chat_query)
 
-    def compile_compact_prompt(self, base_system_prompt: str, config: Optional[ConfigSchema] = None) -> str:
+    def compile_compact_prompt(
+        self,
+        base_system_prompt: str,
+        config: Optional[ConfigSchema] = None,
+        chat_query: Optional[str] = None,
+    ) -> str:
         if not self.manager.is_loaded:
             return base_system_prompt
 
-        parts = [base_system_prompt.strip()] if base_system_prompt else []
+        parts = []
+        self._try_add(parts, base_system_prompt)
         self._try_add(parts, self._build_character_capsule(config))
+        if chat_query:
+            chat_memories = self.manager.get_chat_memories_block(chat_query)
+            self._try_add(parts, chat_memories)
         return "\n\n".join(parts)
 
     def _build_character_capsule(self, config: Optional[ConfigSchema] = None) -> str:
@@ -429,15 +457,15 @@ class CharacterCompiler:
         if not self.manager.is_loaded:
             return base_system_prompt
 
-        parts = [base_system_prompt]
-        parts.append(self._resolve_system_core())
-        parts.append(self._resolve_anti_assistant())
-        parts.append(CORE_RULES_BLOCK)
-        parts.append(NEVER_DO_BLOCK)
+        parts = []
+        self._try_add(parts, base_system_prompt)
+        self._try_add(parts, self._resolve_system_core())
+        self._try_add(parts, self._resolve_anti_assistant())
+        self._try_add(parts, CORE_RULES_BLOCK)
+        self._try_add(parts, NEVER_DO_BLOCK)
 
         dna_block = self._resolve_dna(ignore_mods=True)
-        if dna_block:
-            parts.append(dna_block)
+        self._try_add(parts, dna_block)
 
         return "\n".join(parts)
 
@@ -445,28 +473,27 @@ class CharacterCompiler:
         if not self.manager.is_loaded:
             return base_system_prompt
 
-        parts = [base_system_prompt]
-        parts.append(self._resolve_system_core())
-        parts.append(self._resolve_anti_assistant())
-        parts.append(CORE_RULES_BLOCK)
-        parts.append(NEVER_DO_BLOCK)
+        parts = []
+        self._try_add(parts, base_system_prompt)
+        self._try_add(parts, self._resolve_system_core())
+        self._try_add(parts, self._resolve_anti_assistant())
+        self._try_add(parts, CORE_RULES_BLOCK)
+        self._try_add(parts, NEVER_DO_BLOCK)
 
         dna_block = self._resolve_dna(ignore_mods=True)
-        if dna_block:
-            parts.append(dna_block)
+        self._try_add(parts, dna_block)
 
         soul = getattr(self.manager, '_soul_accessor', None)
         if soul and soul.is_active:
             soul_block = self._resolve_soul()
-            if soul_block:
-                parts.append(soul_block)
+            self._try_add(parts, soul_block)
 
         return "\n".join(parts)
 
     @staticmethod
     def _try_add(parts: list[str], block: str) -> None:
-        if block:
-            parts.append(block)
+        if block and str(block).strip():
+            parts.append(str(block).strip())
 
     def _get_soul_data(self) -> dict | None:
         soul = getattr(self.manager, '_soul_accessor', None)

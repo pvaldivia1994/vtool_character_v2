@@ -234,16 +234,34 @@ def chat_loop(cm: CharacterManager, name: str):
         llm.get_config()
 
         adapter = VToolLlamaAdapter(llm)
+        _ = adapter
         session = llm.create_session(
-            session_id=f"chat_{name.lower()}",
+            session_id=f"runtime_{name.lower()}",
             character_name=name,
-            chat_db_path=str(cm.get_chat_db_path()),
-            persistent=True,
+            persistent=False,
         )
-        session.set_system_prompt(cm.build_full_system_prompt(f"You are {name}."))
-        session.set_character_name(name)
 
         print(f"  Chatting with '{name}'. Type 'quit' to exit.\n")
+
+        history_limit = 10
+        summary_system_prompt = cm.build_default_summary_system_prompt()
+        memory_extraction_prompt = cm.build_default_memory_extraction_prompt()
+
+        if cm.current_episode and getattr(cm.current_episode, "source", "") == "sqlite":
+            backfilled = cm.backfill_context_summary(
+                session_id=str(cm.current_episode.episode_id),
+                chat_callable=lambda messages: session.chat(messages=messages),
+                summary_system_prompt=summary_system_prompt,
+                extraction_system_prompt=memory_extraction_prompt,
+                every_n_messages=history_limit,
+                history_limit=80,
+                title=f"Chat with {name}",
+                model_name=llm.get_model_info().get("model_name", ""),
+                character_name=name,
+            )
+            if backfilled:
+                print(f"  Context summary backfilled in {len(backfilled)} step(s).")
+
         while True:
             try:
                 text = input("  You: ").strip()
@@ -252,10 +270,80 @@ def chat_loop(cm: CharacterManager, name: str):
                 break
             if text.lower() in ("quit", "exit", "q"):
                 break
-            resp = session.chat(text)
+
+            session_id = (
+                str(cm.current_episode.episode_id)
+                if cm.current_episode and getattr(cm.current_episode, "source", "") == "sqlite"
+                else f"chat_{name.lower()}"
+            )
+            if cm.should_summarize_before_next_message(session_id, history_limit=history_limit):
+                refreshed = cm.backfill_context_summary(
+                    session_id=session_id,
+                    chat_callable=lambda messages: session.chat(messages=messages),
+                    summary_system_prompt=summary_system_prompt,
+                    extraction_system_prompt=memory_extraction_prompt,
+                    every_n_messages=history_limit,
+                    history_limit=80,
+                    title=f"Chat with {name}",
+                    model_name=llm.get_model_info().get("model_name", ""),
+                    character_name=name,
+                )
+                if refreshed:
+                    print(f"  Context summary refreshed in {len(refreshed)} step(s) before the next message.")
+
+            history = cm.get_chat_history_messages(session_id=session_id, history_limit=history_limit)
+            messages = cm.build_chat_messages_from_summary(
+                base_system_prompt=f"You are {name}.",
+                user_message=text,
+                session_id=session_id,
+                history_limit=history_limit,
+                chat_query=text,
+            )
+            resp = session.chat(messages=messages)
             print(f"  {name}: {_fmt(resp.content)}")
 
-        session.save_to_store(summary=f"Chat with {name}")
+            flow_steps = [
+                "1. El character cargó el historial relevante desde SQLite.",
+                "2. El character construyó la lista completa de mensajes.",
+                "3. La lista se envió a session.chat(messages=...).",
+                "4. El modelo generó la respuesta.",
+            ]
+
+            if resp.success:
+                assistant_message = {"role": "assistant", "content": resp.content}
+                if resp.thinking:
+                    assistant_message["thinking"] = resp.thinking
+                if resp.tool_calls:
+                    assistant_message["tool_calls"] = resp.tool_calls
+                cm.append_chat_session_messages(
+                    session_id=session_id,
+                    messages=[
+                        {"role": "user", "content": text},
+                        assistant_message,
+                    ],
+                    character_name=name,
+                    model_name=llm.get_model_info().get("model_name", ""),
+                )
+                flow_steps.append("5. El turno se guardó en SQLite sin reemplazar el historial.")
+                flow_steps.append("6. Si el bloque activo llega al limite, el resumen se recalcula antes del siguiente mensaje.")
+            else:
+                flow_steps.append("5. No se escribió en SQLite porque la generación falló.")
+
+            active_summary = cm.get_context_summary(session_id)
+            cm.write_chat_turn_log(
+                session_id=session_id,
+                turn_index=cm.count_chat_turn_logs() + 1,
+                user_message=text,
+                response_message=resp.content,
+                messages_sent=messages,
+                flow_steps=flow_steps,
+                error=None if resp.success else resp.error,
+                system_prompt=messages[0].get("content", ""),
+                chat_query=text,
+                context_summary=active_summary.summary if active_summary else "",
+                summarized_message_count=active_summary.summarized_message_count if active_summary else 0,
+                source_messages=history,
+            )
 
     except (ImportError, Exception) as e:
         print(f"  LLM unavailable ({type(e).__name__}), showing prompt preview.")
@@ -266,9 +354,12 @@ def chat_loop(cm: CharacterManager, name: str):
     cm.save_state()
     cm.save_psychology_state()
 
-    sessions = cm.list_chat_sessions()
-    if sessions:
-        print(f"  Saved sessions: {len(sessions)}")
+    try:
+        sessions = cm.list_chat_sessions()
+        if sessions:
+            print(f"  Saved sessions: {len(sessions)}")
+    except RuntimeError:
+        pass
 
 
 # ── main ─────────────────────────────────────────────────────────────
